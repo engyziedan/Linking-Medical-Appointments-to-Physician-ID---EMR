@@ -1,0 +1,175 @@
+Sys.setenv(JAVA_HOME='')
+Sys.setenv("AWS_ACCESS_KEY_ID"="",
+           "AWS_SECRET_ACCESS_KEY"="")
+
+options(java.parameters = "-Xmx100g")
+library(rJava)
+library(DBI)
+library(RJDBC)
+library(dplyr)
+library(tibble)
+library(tictoc)
+library(aws.s3)
+library(ggplot2)
+library(stringr)
+
+fil<-''
+
+
+drv <- JDBC(driverClass="", fil, identifier.quote="'")
+
+
+con<-dbConnect(drv,'',
+               uid=
+               password =
+               s3_staging_dir=
+               Schema=
+               region=
+               Workgroup=
+dbListTables(con)
+
+##############################################
+
+# create table appt_2022 with required columns containing records for the year 2022 from table appointment
+query = "create table appt_2022 with (format = 'PARQUET') as
+         select client_hash, chart_hash, date, specialty, provider_id, delete_indicator, client_appt_id
+         from appointment 
+         where date like '2022%'"
+
+df_appt_2022= dbGetQuery(con, query)
+
+#left join appt_2022 and demographic_npi_loc to get the zip(3 digit) for JANUARY,2022
+mth = c('01')
+i = 1
+query = paste0("with appt_jan as (select * from appt_2022 where date like '2022",mth[i],"%')
+            
+                select appt.*, dnp.zip
+                from appt_jan appt
+                left join demographic_non_phi dnp
+                  on appt.client_hash = dnp.client_hash
+                  and appt.chart_hash = dnp.chart_hash")
+
+
+tic()
+df_appt_zip = dbGetQuery(con, query)
+toc()
+
+# save the records
+path = ""
+write.csv(df_appt_zip, file = paste0(path,".csv"), row.names = FALSE)
+# fetch the records
+df_appt_zip = read.csv(file = paste0(path,".csv"))
+
+# get client_hash, provider_id, provider_npi from enc_npi_loc - Bob's code
+query = "select distinct client_hash, provider_id, provider_npi
+         from enc_npi_loc
+         where coalesce(provider_id, '') not in ('','[REDACTED]','[INVALID]')
+         union
+         select distinct client_hash, provider_npi as provider_id, provider_npi
+         from enc_npi_loc
+         where coalesce(provider_npi, '') not in ('','[REDACTED]','[INVALID]')"
+
+df_enc_npi_loc = dbGetQuery(con, query)
+
+## left join df_appt_zip with enc_npi_loc on client_hash, provider_id and fetch provider_npi
+df_appt_zip_npi = left_join(df_appt_zip, df_enc_npi_loc, by = c('client_hash','provider_id'))
+
+# save the records
+path = ""
+write.csv(df_appt_zip_npi, file = paste0(path,".csv"), row.names = FALSE)
+# fetch the records
+df_appt_zip_npi = read.csv(file = paste0(path,".csv"))
+
+# check what are the distinct invalid npi values such as NA or ''
+df_appt_zip_npi %>% 
+  filter(!grepl("[0-9]",provider_npi)) %>% 
+  distinct(provider_npi)
+
+## share of valid/invalid provider_npi
+df_appt_npi_share = df_appt_zip_npi %>%
+                      mutate(validity = case_when(is.na(provider_npi)  ~ 'invalid',
+                                                  provider_npi == '' ~ 'empty',
+                                                  TRUE ~ 'valid')) %>%
+                      group_by(validity) %>%
+                      summarise(count = n()) %>%
+                      mutate(share = round(count/sum(count) * 100.0, 2))
+# adding total count 
+df_appt_npi_share = df_appt_npi_share %>%
+                      add_row(validity = 'total', count = sum(df_appt_npi_share$count))
+# save the records
+path = ""
+write.csv(df_appt_npi_share, file = paste0(path,".csv"), row.names = FALSE)
+
+## share of valid/invalid provider_npi condition on delete_indicator as 'N' or '0'
+df_appt_npi_share_delInd = df_appt_zip_npi %>%
+                             filter(delete_indicator == 'N' | delete_indicator == '0') %>%
+                             mutate(validity = case_when(is.na(provider_npi)  ~ 'invalid',
+                                                         provider_npi == '' ~ 'empty',
+                                                         TRUE ~ 'valid')) %>%
+                             group_by(validity) %>%
+                             summarise(count = n()) %>%
+                             mutate(share = round(count/sum(count) * 100.0, 2))
+
+# adding total count
+df_appt_npi_share_delInd = df_appt_npi_share_delInd %>%
+                      add_row(validity = 'total', count = sum(df_appt_npi_share_delInd$count))
+
+# save the records
+path = ""
+write.csv(df_appt_npi_share_delInd, file = paste0(path,".csv"),row.names = FALSE)
+
+#fetch the distinct combinations of client_hash, client_appt_id and location_id
+query = "select distinct client_hash, client_appt_id, location_id
+         from enc_npi_loc 
+         where client_appt_id is not null and location_id is not null"
+tic()
+df_enc_loc = dbGetQuery(con, query)
+toc()
+# save the records
+path = ""
+write.csv(df_enc_loc, file = paste0(path,".csv"),row.names = FALSE)
+# fetch the records
+df_enc_loc = read.csv(file = paste0(path,".csv"))
+# convert column client_appt_id from numeric to character
+df_enc_loc = df_enc_loc %>%
+              mutate(client_appt_id = as.character(client_appt_id))
+
+#left join df_appt_zip_npi and enc_npi_loc on client_hash, client_appt_id
+df_appt_zip_npi_loc = left_join(df_appt_zip_npi, df_enc_loc, by= c('client_hash','client_appt_id'))
+# save the records
+path = ""
+write.csv(df_appt_zip_npi_loc, file = paste0(path,".csv"),row.names = FALSE)
+# fetch the records
+df_appt_zip_npi_loc = read.csv(file = paste0(path,".csv"))
+
+# get count of missing location_id 
+df_appt_zip_npi_loc %>%
+  filter(is.na(location_id)) %>%
+  summarise(count=n())
+
+# query to check if there are multiple location_id associated with a client_appt_id
+query = #"with subset as (select client_hash, client_appt_id, location_id
+         #               from enc_npi_loc 
+          #              where client_appt_id is not null 
+           #             limit 5000000)
+         "select client_hash, client_appt_id, location_id,
+                rank() over (partition by client_hash, client_appt_id, location_id
+                                  order by location_id) as dup
+         from enc_npi_loc
+         where location_id is not null and client_appt_id is not null
+        "
+df_subset = dbGetQuery(con, query)
+
+query = "with s as (select * 
+                    from enc_npi_loc 
+                    where client_hash = '' 
+                    and client_appt_id = '')
+         select client_hash, client_appt_id, location_id,
+                rank() over (partition by (client_hash, client_appt_id, location_id)
+                                   order by (client_hash, client_appt_id, location_id)) as dup
+         from s
+        "
+
+df = dbGetQuery(con, query)
+
+
